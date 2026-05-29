@@ -12,6 +12,10 @@ const router = express.Router();
 const MAX_FILE_SIZE_MB = Number(process.env.MAX_UPLOAD_MB || 8);
 const allowedMimeTypes = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
+// How long to wait for BTC market data before giving up and proceeding without it.
+// Set high so Render's slow cold-start network has time to complete.
+const BTC_FETCH_BUDGET_MS = Number(process.env.BTC_FETCH_BUDGET_MS || 55_000);
+
 const upload = multer({
   dest: 'uploads/',
   limits: {
@@ -41,6 +45,20 @@ function multerMiddleware(req, res) {
       }
       reject(error);
     });
+  });
+}
+
+// Wraps a promise with a wall-clock deadline.
+// Resolves with { value } on success, { timedOut: true } on timeout — never rejects.
+function withBudget(promise, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      console.warn(`[analyze] BTC fetch budget (${ms}ms) exceeded — proceeding without market context`);
+      resolve({ timedOut: true });
+    }, ms);
+    promise
+      .then((value) => { clearTimeout(timer); resolve({ value }); })
+      .catch((err)  => { clearTimeout(timer); console.error('[analyze] BTC fetch error:', err.message); resolve({ timedOut: true }); });
   });
 }
 
@@ -88,28 +106,40 @@ router.post('/', async (req, res) => {
   let ocrText = '';
   let marketContext = null;
 
+  // ── Kick off BTC fetch IMMEDIATELY on request arrival, before anything else.
+  // This gives it the maximum possible time while the image is being processed.
+  const btcFetchPromise = withBudget(getBitcoinMarketContext(), BTC_FETCH_BUDGET_MS);
+
   try {
     await multerMiddleware(req, res);
 
     if (!req.file) {
       return res.status(400).json({
         success: false,
-        error: {
-          code: 'NO_IMAGE',
-          message: 'Upload a chart screenshot before running analysis.',
-        },
+        error: { code: 'NO_IMAGE', message: 'Upload a chart screenshot before running analysis.' },
       });
     }
 
     filesToClean.push(req.file.path);
 
+    // Preprocess image + OCR in parallel while BTC fetch is already running in background
     const processed = await preprocessChartImage(req.file.path);
     filesToClean.push(processed.analysisPath, processed.ocrPath);
 
-    [ocrText, marketContext] = await Promise.all([
+    // Wait for OCR and BTC fetch together (BTC fetch may already be done by now)
+    const [ocrResult, btcResult] = await Promise.all([
       extractChartText(processed.ocrPath),
-      getBitcoinMarketContext(),
+      btcFetchPromise,
     ]);
+
+    ocrText = ocrResult;
+    marketContext = btcResult.timedOut ? null : btcResult.value;
+
+    if (marketContext) {
+      console.log(`[analyze] BTC context ready — source: ${marketContext.source}, trend: ${marketContext.trend}`);
+    } else {
+      console.warn('[analyze] Proceeding without BTC context (timed out or failed)');
+    }
 
     const analysis = await analyzeChart(processed.analysisPath, {
       mimeType: processed.mimeType,
@@ -150,13 +180,7 @@ router.post('/', async (req, res) => {
           }),
           ocrText,
           marketContext,
-          preprocessing: {
-            resized: true,
-            contrastEnhanced: true,
-            ocrOptimized: true,
-            compressed: true,
-            degraded: true,
-          },
+          preprocessing: { resized: true, contrastEnhanced: true, ocrOptimized: true, compressed: true, degraded: true },
         },
       });
     }
@@ -173,10 +197,8 @@ router.post('/', async (req, res) => {
     });
   } finally {
     await Promise.all(filesToClean.map(removeQuietly));
-
     try {
-      const uploadDir = path.resolve('uploads');
-      await fs.mkdir(uploadDir, { recursive: true });
+      await fs.mkdir(path.resolve('uploads'), { recursive: true });
     } catch {}
   }
 });
